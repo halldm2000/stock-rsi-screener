@@ -11,6 +11,7 @@ A Python-based RSI (Relative Strength Index) screener that monitors multiple sto
 - Continuous monitoring mode
 - Sorted display by RSI values
 - Optional Slack and email notifications
+- SMS notifications via carrier email gateways
 
 ## Installation
 
@@ -66,6 +67,38 @@ python rsi_screener.py --file tickers.txt --overbought 80 --oversold 20
 The screener supports notifications via:
 - Slack (set `SLACK_WEBHOOK` environment variable)
 - Email (set `EMAIL_FROM` and `EMAIL_TO` environment variables)
+- SMS via carrier email gateways (configure in `config.local.py`)
+
+### Setting up SMS Notifications
+
+1. Copy the template configuration:
+```bash
+cp config.template.py config.local.py
+```
+
+2. Edit `config.local.py` with your settings:
+```python
+EMAIL_FROM = 'your-gmail@gmail.com'  # Use your Gmail address
+EMAIL_TO = 'your-phone-number@tmomail.net'  # Your carrier's email gateway
+```
+
+3. Set up Gmail App Password:
+   - Go to your Google Account settings
+   - Navigate to Security > 2-Step Verification
+   - At the bottom, click on "App passwords"
+   - Select "Mail" and your device
+   - Copy the generated 16-character password
+   - Set it as an environment variable:
+     ```bash
+     export GMAIL_APP_PASSWORD='your-16-character-app-password'
+     ```
+
+4. Carrier Email Gateways:
+   - T-Mobile: number@tmomail.net
+   - AT&T: number@txt.att.net
+   - Verizon: number@vtext.com
+   - Sprint: number@messaging.sprintpcs.com
+   - Virgin Mobile: number@vmobl.com
 
 ## License
 

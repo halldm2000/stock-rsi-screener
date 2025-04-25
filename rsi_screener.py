@@ -19,11 +19,10 @@ python rsi_screener.py --file tickers.txt --continuous
 # Set interval between checks (in seconds, default is 300)
 python rsi_screener.py --file tickers.txt --continuous --interval 600
 
-Environment variables for optional notifications
-------------------------------------------------
-SLACK_WEBHOOK   – Slack incoming‑webhook URL
-EMAIL_FROM      – sender address for SMTP localhost
-EMAIL_TO        – comma‑separated recipient list
+Configuration
+------------
+All settings are stored in config.local.py. Copy config.template.py to config.local.py
+and customize with your settings.
 """
 
 import argparse
@@ -31,26 +30,44 @@ import os
 import sys
 import re
 import time
-import numpy as np
+import json
+import requests
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
+from twilio.rest import Client
 
+# Try to load local configuration
+try:
+    from config.local import (
+        EMAIL_FROM, EMAIL_TO,
+        EMAIL_HOST, EMAIL_PORT, EMAIL_USE_TLS, EMAIL_USER, EMAIL_PASSWORD,
+        TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+        TWILIO_PHONE_NUMBER, TWILIO_TO_NUMBER,
+    )
+except ImportError:
+    print("\nWarning: Local configuration not found.")
+    print("Please copy config.template.py to config.local.py and customize with your settings.")
+    print("See config.template.py for instructions.\n")
+    sys.exit(1)
+
+# Default notification settings
+DEFAULT_EMAIL_FROM = 'rsi-screener@localhost'
 
 # Custom RSI calculation instead of using pandas_ta
 def calculate_rsi(data, window=14):
-    """Calculate RSI directly without pandas_ta dependency"""
+    """Calculate RSI directly without pandas_ta dependency. Assumes input is a pandas Series."""
+    # The input 'data' should already be the 'Close' price Series
+    
     delta = data.diff()
-    up, down = delta.copy(), delta.copy()
-    up[up < 0] = 0
-    down[down > 0] = 0
-    down = down.abs()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     
-    avg_gain = up.rolling(window=window).mean()
-    avg_loss = down.rolling(window=window).mean()
-    
-    rs = avg_gain / avg_loss
+    rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
@@ -68,19 +85,46 @@ def parse_ticker_file(path: str) -> list[str]:
 
 def fetch_rsi(symbol: str, period: str, interval: str, length: int = 14):
     """Return last close and RSI value."""
-    df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
+    # Explicitly set auto_adjust=False to ensure 'Close' column is present
+    df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False, auto_adjust=False)
     if df.empty:
         raise ValueError("no data")
     
-    # Calculate RSI using our custom function
-    df['RSI'] = calculate_rsi(df['Close'], window=length)
+    # Check if 'Close' column exists and get the last close value first
+    if 'Close' not in df.columns:
+        print(f"DEBUG: 'Close' column not found for {symbol}. Available columns: {df.columns.tolist()}")
+        raise KeyError("'Close' column missing in downloaded data")
     
-    latest = df.iloc[-1]
-    # Fix warnings by using iloc[0] for Pandas Series conversion
-    last_rsi = latest['RSI'].iloc[0] if isinstance(latest['RSI'], pd.Series) else latest['RSI']
-    last_close = latest['Close'].iloc[0] if isinstance(latest['Close'], pd.Series) else latest['Close']
-    
-    return float(last_close), float(last_rsi)
+    # Check if all Close values are NaN explicitly
+    all_nan = df['Close'].isnull().all()
+    # Use .item() to extract the single boolean value from the Series
+    if all_nan.item(): 
+        raise ValueError(f"'Close' column contains only NaN values for {symbol}")
+        
+    # Ensure last_close is a scalar before checking pd.isna
+    last_close_val = df['Close'].iloc[-1]
+    if isinstance(last_close_val, pd.Series):
+        last_close_val = last_close_val.item()
+
+    if pd.isna(last_close_val):
+        # If the very last close is NaN, try to find the last valid one
+        last_valid_close = df['Close'].dropna().iloc[-1]
+        if isinstance(last_valid_close, pd.Series): # Also ensure this is scalar
+            last_valid_close = last_valid_close.item()
+            
+        if pd.notna(last_valid_close):
+            last_close_val = last_valid_close
+            print(f"Warning: Last close for {symbol} was NaN, using last valid price: {last_close_val:.2f}")
+        else:
+            raise ValueError(f"Could not find any valid 'Close' price for {symbol}")
+
+    # Calculate RSI using our custom function, passing the Close Series
+    rsi_series = calculate_rsi(df['Close'], window=length)
+    last_rsi = rsi_series.iloc[-1]
+    if isinstance(last_rsi, pd.Series): # Ensure last_rsi is scalar too
+        last_rsi = last_rsi.item()
+
+    return float(last_close_val), float(last_rsi)
 
 
 def calculate_rsi_for_ticker(ticker, period="1mo", interval="1d", rsi_length=14):
@@ -94,32 +138,77 @@ def calculate_rsi_for_ticker(ticker, period="1mo", interval="1d", rsi_length=14)
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
     except Exception as e:
-        print(f"Error calculating RSI for {ticker}: {str(e)}")
+        import traceback
+        print(f"Error calculating RSI for {ticker}:")
+        traceback.print_exc() # Print full traceback for better debugging
         return None
 
 
-def alert_slack(msg: str):
-    url = os.getenv('SLACK_WEBHOOK')
-    if not url:
-        return
-    import requests, json
-    try:
-        requests.post(url, json={'text': msg}, timeout=5)
-    except Exception:
-        pass
-
-
 def alert_email(subject: str, body: str):
-    sender = os.getenv('EMAIL_FROM')
-    recipients = os.getenv('EMAIL_TO')
-    if not (sender and recipients):
-        return
-    import smtplib
-    from email.mime.text import MIMEText
-    msg = MIMEText(body)
-    msg['Subject'], msg['From'], msg['To'] = subject, sender, recipients
-    with smtplib.SMTP('localhost') as s:
-        s.sendmail(sender, recipients.split(','), msg.as_string())
+    """Send email alert using configured SMTP server"""
+    # Check if all required email configuration exists
+    required_email_config = [
+        EMAIL_FROM, EMAIL_TO, EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD
+    ]
+    if not all(required_email_config):
+        print("❌ Missing required Email configuration in config.local.py")
+        print("   (Requires: EMAIL_FROM, EMAIL_TO, EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD)")
+        return False
+        
+    try:
+        # Create the email message
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_FROM
+        msg['To'] = EMAIL_TO
+        
+        # Connect to the SMTP server and send
+        print(f"Connecting to SMTP server {EMAIL_HOST}:{EMAIL_PORT}...")
+        if EMAIL_USE_TLS:
+            server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+        else: # Assumes SSL or no encryption (adjust if SSL needed)
+             # For SSL use smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT)
+             # Might need separate config var for SSL vs TLS vs None
+             server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+             
+        server.login(EMAIL_USER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        server.quit()
+        print("✅ Email alert sent successfully!")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        print(f"❌ Error sending email: SMTP Authentication failed. Check EMAIL_USER/EMAIL_PASSWORD.")
+        return False
+    except Exception as e: # Catch other potential errors
+        print(f"❌ Error sending email alert: {str(e)}")
+        return False
+
+
+def alert_twilio(message: str):
+    """Send SMS alert using Twilio"""
+    try:
+        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, TWILIO_TO_NUMBER]):
+            print("❌ Missing Twilio credentials in config.local.py")
+            print("Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, and TWILIO_TO_NUMBER")
+            return False
+        
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        message = client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE_NUMBER,
+            to=TWILIO_TO_NUMBER
+        )
+        
+        print("✅ SMS alert sent successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Error sending SMS alert: {str(e)}")
+        print("Please check your Twilio credentials in config.local.py")
+        return False
 
 
 def check_rsi_signals(rsi_data, oversold_threshold=30, overbought_threshold=70):
@@ -259,35 +348,90 @@ def main():
     if args.continuous:
         run_continuous_mode(symbols, args)
     else:
-        run_single_check(symbols, args)
+        run_single_check(symbols, args.oversold, args.overbought)
 
 
-def run_single_check(symbols, args):
-    rows, alerts = [], []
-    for sym in symbols:
-        try:
-            rsi_data = calculate_rsi_for_ticker(sym, args.period, args.data_interval)
-            if rsi_data:
-                status = '-'
-                rsi_val = rsi_data['rsi']
-                price = rsi_data['price']
+def run_single_check(symbols, oversold_threshold, overbought_threshold):
+    """Run a single check on the provided symbols"""
+    print("\nRunning single check...")
+    try:
+        results = []
+        alerts = []
+        
+        # Process each symbol individually
+        for ticker in symbols:
+            print(f"Processing: {ticker}")
+            try:
+                # Fetch RSI data for the current ticker
+                # NOTE: We need period and interval args here. Let's use the defaults from main() for now.
+                # Consider passing args down or making them global if needed.
+                rsi_data = calculate_rsi_for_ticker(ticker, period="90d", interval="1d")
                 
-                alert_msg = check_rsi_signals(rsi_data, args.oversold, args.overbought)
-                if alert_msg:
-                    alerts.append(alert_msg)
-                    status = "OVERBOUGHT" if rsi_val >= args.overbought else "OVERSOLD"
+                if rsi_data:
+                    # Check for signals
+                    alert_msg = check_rsi_signals(rsi_data, oversold_threshold, overbought_threshold)
+                    if alert_msg:
+                        alerts.append(alert_msg)
+                    
+                    # Store result for display
+                    results.append({
+                        'Ticker': ticker,
+                        'RSI': rsi_data['rsi'],
+                        'Price': rsi_data['price'],
+                        'Time': rsi_data['time']
+                    })
+                else:
+                    results.append({
+                        'Ticker': ticker,
+                        'RSI': float('nan'), # Indicate error or missing data
+                        'Price': float('nan'),
+                        'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+
+            except Exception as e:
+                print(f"Error processing {ticker}: {str(e)}")
+                results.append({
+                    'Ticker': ticker,
+                    'RSI': float('nan'), # Indicate error
+                    'Price': float('nan'),
+                    'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+        
+        # Create DataFrame for display
+        if results:
+            df = pd.DataFrame(results)
+            df['Time'] = pd.to_datetime(df['Time'])
+            # Format Price and RSI for display AFTER sorting
+            df = df.sort_values('RSI', na_position='last') # Sort by RSI, errors last
+            
+            # Apply formatting
+            df['Price'] = df['Price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else 'n/a')
+            df['RSI'] = df['RSI'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else 'n/a')
+            df['Time'] = df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Display results
+            print("\nRSI Results:")
+            print(df.to_string(index=False))
+        else:
+            print("\nNo results to display.")
+
+        # Send alerts if any
+        if alerts:
+            print("\n🚨 Alerts triggered!")
+            # Combine alerts into single messages for services that prefer it
+            alert_message = '\n'.join(alerts)
+            
+            for alert in alerts: # Print individual alerts to console
+                print(alert)
                 
-                rows.append({'Symbol': sym, 'Close': f"{price:.2f}", 'RSI': f"{rsi_val:.1f}", 'Signal': status})
-        except Exception as e:
-            rows.append({'Symbol': sym, 'Close': 'n/a', 'RSI': 'n/a', 'Signal': str(e)})
-
-    df = pd.DataFrame(rows)
-    print(df.to_string(index=False))
-
-    if alerts:
-        message = '\n'.join(alerts)
-        alert_slack(message)
-        alert_email('RSI Screener Alert', message)
+            # Send SMS alert using Twilio (combined message)
+            alert_twilio(alert_message)
+            
+            # Send email alert (using combined message as body)
+            alert_email('RSI Screener Alert', alert_message)
+            
+    except Exception as e:
+        print(f"Error during check: {str(e)}")
 
 
 def run_continuous_mode(symbols, args):
@@ -382,7 +526,6 @@ def run_continuous_mode(symbols, args):
             # Send alerts to Slack/email if any
             if alerts:
                 message = '\n'.join(alerts)
-                alert_slack(message)
                 alert_email('RSI Screener Alert', message)
             
             # Wait before next check

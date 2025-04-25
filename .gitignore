@@ -33,6 +33,8 @@ env/
 
 # Environment variables
 .env
+config.local.py
+config/local.py
 
 # Logs
 *.log
